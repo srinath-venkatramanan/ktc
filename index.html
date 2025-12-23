@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Kannada PDF → Tamil PDF (Veda-friendly)</title>
+  <link rel="stylesheet" href="styles.css" />
+
+  <!-- Aksharamukha.js (browser, offline transliteration) -->
+  <script src="https://cdn.jsdelivr.net/npm/aksharamukha@latest/dist/index.global.js"></script>
+  <!-- Tesseract.js v5 -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <!-- pdf-lib -->
+  <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+</head>
+
+<body>
+  <div class="wrap">
+    <h1>Kannada PDF → Tamil PDF</h1>
+    <p class="sub">
+      Supports <b>text PDFs</b> and <b>scanned/image PDFs</b> (OCR). Output is a new Tamil PDF.
+    </p>
+
+    <div class="card">
+      <label class="row">
+        <span>Upload PDF</span>
+        <input id="pdfFile" type="file" accept="application/pdf" />
+      </label>
+
+      <label class="row">
+        <span>Output script</span>
+        <select id="toScript">
+          <option value="TamilExtended" selected>TamilExtended (best for Sanskrit/veda sounds)</option>
+          <option value="Tamil">Tamil</option>
+        </select>
+      </label>
+
+      <label class="row">
+        <span>OCR mode (only used if page has no text)</span>
+        <select id="ocrLang">
+          <option value="kan" selected>Kannada (kan)</option>
+          <option value="eng">English (eng)</option>
+        </select>
+      </label>
+
+      <button id="convertBtn" disabled>Convert to Tamil PDF</button>
+
+      <div class="progress">
+        <div id="status">Load a PDF to begin.</div>
+        <progress id="bar" value="0" max="100"></progress>
+      </div>
+
+      <div id="downloadArea" class="download"></div>
+    </div>
+
+    <details class="tips">
+      <summary>Tips for best accuracy</summary>
+      <ul>
+        <li>Text PDFs will be fastest and most accurate.</li>
+        <li>For scanned PDFs, clear scans + high contrast improves OCR.</li>
+        <li>If OCR is imperfect, we can add a “review & edit before export” step next.</li>
+      </ul>
+    </details>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
