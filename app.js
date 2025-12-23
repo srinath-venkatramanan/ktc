@@ -1,349 +1,387 @@
-// src/app.js
+// app.js (ES module)
 
-import * as pdfjsLib from "pdfjs-dist";
-import pdfjsWorker from "pdfjs-dist/build/pdf.worker.min.mjs";
+const pdfFile = document.getElementById("pdfFile");
+const convertBtn = document.getElementById("convertBtn");
+const toScriptEl = document.getElementById("toScript");
+const ocrLangEl = document.getElementById("ocrLang");
+const statusEl = document.getElementById("status");
+const barEl = document.getElementById("bar");
+const downloadArea = document.getElementById("downloadArea");
 
-import { createWorker } from "tesseract.js";
+// Globals from CDN scripts
+const { PDFDocument, StandardFonts } = window.PDFLib;
+const pdfjsLib = window.pdfjsLib;
+const fontkit = window.fontkit;
 
-import { PDFDocument, rgb } from "pdf-lib";
-import fontkit from "@pdf-lib/fontkit";
+// Aksharamukha global (be defensive about name)
+const AksharamukhaGlobal =
+  window.Aksharamukha || window.aksharamukha || window.AksharamukhaLib || null;
 
-// Aksharamukha.js (npm package "aksharamukha")
-import Aksharamukha from "aksharamukha";
-
-// -----------------------
-// CONFIG
-// -----------------------
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
-
-// OCR tuning: higher scale => better OCR but slower
-const OCR_RENDER_SCALE = 2.0;
-
-// Tesseract settings
-const TESS_LANG = "kan"; // Kannada (kan) :contentReference[oaicite:3]{index=3}
-const TESS_LANG_PATH = "https://tessdata.projectnaptha.com/4.0.0"; // public hosted traineddata
-// If you want faster but less accurate, try a different tessdata source later.
-
-// Output PDF formatting
-const PDF_FONT_URL = "/fonts/NotoSansTamil-Regular.ttf";
-const FONT_SIZE = 13;
-const PAGE_MARGIN = 42;
-const LINE_GAP = 5;
-
-// -----------------------
-// UI helpers
-// -----------------------
-const $ = (id) => document.getElementById(id);
-
-function setStatus(msg) {
-  const el = $("status");
-  if (el) el.textContent = msg;
-  console.log(msg);
+function setStatus(msg, pct = null) {
+  statusEl.textContent = msg;
+  if (pct !== null) {
+    barEl.value = Math.max(0, Math.min(100, pct));
+  }
 }
 
-function setDownload(blob, filename) {
-  const link = $("downloadLink");
-  if (!link) return;
-  const url = URL.createObjectURL(blob);
-  link.href = url;
-  link.download = filename;
-  link.style.display = "inline-block";
-  link.textContent = `Download: ${filename}`;
+function resetUI() {
+  downloadArea.innerHTML = "";
+  barEl.value = 0;
 }
 
-// -----------------------
-// Lazy singletons
-// -----------------------
-let aksh = null;
-async function getAksharamukha() {
-  if (aksh) return aksh;
-  setStatus("Loading transliteration engine (Aksharamukha)...");
-  aksh = await Aksharamukha.new(); // WASM init
-  return aksh;
-}
+pdfFile.addEventListener("change", () => {
+  resetUI();
+  if (pdfFile.files?.[0]) {
+    convertBtn.disabled = false;
+    setStatus("Ready. Click Convert to start.", 0);
+  } else {
+    convertBtn.disabled = true;
+    setStatus("Load a PDF to begin.", 0);
+  }
+});
 
-let ocrWorker = null;
-async function getOcrWorker(progressCb) {
-  if (ocrWorker) return ocrWorker;
+convertBtn.addEventListener("click", async () => {
+  resetUI();
 
-  setStatus("Initializing OCR engine (Tesseract)...");
-  ocrWorker = await createWorker({
-    logger: (m) => {
-      if (m?.status && typeof m.progress === "number") {
-        progressCb?.(m.status, m.progress);
+  const file = pdfFile.files?.[0];
+  if (!file) return;
+
+  try {
+    convertBtn.disabled = true;
+
+    // Load input bytes for both PDF.js and pdf-lib output
+    const inputBytes = new Uint8Array(await file.arrayBuffer());
+
+    setStatus("Opening PDF…", 2);
+
+    // PDF.js document for extraction + rendering
+    const loadingTask = pdfjsLib.getDocument({ data: inputBytes });
+    const pdf = await loadingTask.promise;
+    const numPages = pdf.numPages;
+
+    // Create OCR worker once (reused across pages)
+    const ocrLang = ocrLangEl.value; // "kan" or "eng"
+    setStatus(`Initializing OCR (${ocrLang})…`, 4);
+
+    const worker = await Tesseract.createWorker({
+      logger: (m) => {
+        // m.progress is 0..1 for OCR stage
+        if (m.status && typeof m.progress === "number") {
+          // we don't want the bar to jump wildly; keep it subtle per page
+          // overall progress is handled per-page below
+        }
+      },
+    });
+
+    await worker.loadLanguage(ocrLang);
+    await worker.initialize(ocrLang);
+
+    // Collect transliterated text per page (string)
+    const outPagesText = [];
+
+    for (let pageNo = 1; pageNo <= numPages; pageNo++) {
+      const basePct = 5 + Math.floor(((pageNo - 1) / numPages) * 80);
+      setStatus(`Reading page ${pageNo}/${numPages}…`, basePct);
+
+      const page = await pdf.getPage(pageNo);
+
+      // Try text extraction first
+      const text = await extractTextFromPdfJsPage(page);
+
+      let pageText = normalizeExtractedText(text);
+
+      // If no text layer (or too little), OCR it
+      if (!hasUsefulText(pageText)) {
+        setStatus(`Page ${pageNo}: no text layer found → running OCR…`, basePct);
+
+        const canvas = await renderPageToCanvas(page, 2.0); // scale 2x for OCR
+        const ocrResult = await worker.recognize(canvas);
+        pageText = normalizeExtractedText(ocrResult?.data?.text || "");
+
+        // Cleanup canvas to free memory
+        canvas.width = 1;
+        canvas.height = 1;
       }
-    },
-  });
 
-  await ocrWorker.loadLanguage(TESS_LANG);
-  await ocrWorker.initialize(TESS_LANG);
+      // Transliterate Kannada → Tamil/TamilExtended
+      const toScript = toScriptEl.value; // "TamilExtended" or "Tamil"
+      setStatus(`Transliterating page ${pageNo}/${numPages} → ${toScript}…`, basePct + 2);
 
-  // Helpful defaults for scanned pages
-  await ocrWorker.setParameters({
-    // Improve recognition for block text
-    tessedit_pageseg_mode: "6",
-  });
+      const tamilText = transliterateKannadaToTamil(pageText, toScript);
 
-  return ocrWorker;
-}
+      outPagesText.push(tamilText);
 
-// -----------------------
-// PDF text extraction (text-layer)
-// -----------------------
-async function extractTextLayer(pdf, pageNum) {
-  const page = await pdf.getPage(pageNum);
-  const content = await page.getTextContent();
-  const items = content.items || [];
-  const text = items.map((it) => it.str).join(" ").replace(/\s+/g, " ").trim();
-  return text;
-}
+      const pct = 5 + Math.floor((pageNo / numPages) * 80);
+      setStatus(`Done page ${pageNo}/${numPages}.`, pct);
+    }
 
-// -----------------------
-// Render PDF page -> canvas for OCR
-// -----------------------
-async function renderPageToCanvas(pdf, pageNum, scale = OCR_RENDER_SCALE) {
-  const page = await pdf.getPage(pageNum);
-  const viewport = page.getViewport({ scale });
+    setStatus("Finalizing output PDF…", 90);
 
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    // Build a new formatted PDF with a proper Tamil font
+    const outPdfBytes = await buildTamilPdf(outPagesText);
 
-  canvas.width = Math.ceil(viewport.width);
-  canvas.height = Math.ceil(viewport.height);
+    // OCR worker cleanup
+    await worker.terminate();
 
-  await page.render({ canvasContext: ctx, viewport }).promise;
-  return canvas;
-}
+    setStatus("Done! Preparing download…", 100);
 
-// -----------------------
-// OCR a canvas (Kannada)
-// -----------------------
-async function ocrCanvasToText(canvas, pageNum, totalPages) {
-  const worker = await getOcrWorker((status, progress) => {
-    const pct = Math.round(progress * 100);
-    setStatus(`OCR page ${pageNum}/${totalPages}: ${status} (${pct}%)`);
-  });
+    const blob = new Blob([outPdfBytes], { type: "application/pdf" });
+    const url = URL.createObjectURL(blob);
 
-  // Tesseract accepts canvas directly
-  const { data } = await worker.recognize(canvas);
-  const text = (data?.text || "").replace(/\s+\n/g, "\n").trim();
-  return text;
-}
+    const outName = file.name.replace(/\.pdf$/i, "") + " - Tamil.pdf";
+    downloadArea.innerHTML = `
+      <a class="btn" href="${url}" download="${escapeHtml(outName)}">Download Tamil PDF</a>
+      <div class="hint">Tip: If OCR is slow, try fewer pages or ensure scans are clear (straight, high contrast).</div>
+    `;
+  } catch (err) {
+    console.error(err);
+    setStatus(`Error: ${err?.message || String(err)}`, 0);
+  } finally {
+    convertBtn.disabled = false;
+  }
+});
 
-// -----------------------
-// Kannada -> Tamil transliteration
-// -----------------------
-async function kannadaToTamil(text) {
-  const engine = await getAksharamukha();
-  // Aksharamukha.js uses same script names as the main tool
-  // Source: Kannada, Target: Tamil
-  const out = await engine.process("Kannada", "Tamil", text);
+/* ----------------------------
+   PDF.js text extraction
+----------------------------- */
+async function extractTextFromPdfJsPage(page) {
+  const textContent = await page.getTextContent();
+  // Items contain strings + positioning; simplest is to join with spaces/newlines.
+  // We'll try to insert newlines when y-position changes significantly.
+  const items = textContent.items || [];
+  if (!items.length) return "";
+
+  let out = "";
+  let lastY = null;
+
+  for (const it of items) {
+    const s = it.str || "";
+    // transform[5] is Y in PDF.js text item transform
+    const y = it.transform?.[5];
+
+    if (lastY !== null && y !== undefined && Math.abs(y - lastY) > 6) {
+      out += "\n";
+    } else if (out && !out.endsWith("\n")) {
+      out += " ";
+    }
+
+    out += s;
+    if (y !== undefined) lastY = y;
+  }
   return out;
 }
 
-// -----------------------
-// Build output PDF with proper Tamil font
-// -----------------------
-async function buildTamilPdf(pagesTamilText) {
-  setStatus("Building output PDF...");
+function normalizeExtractedText(s) {
+  return (s || "")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
 
+function hasUsefulText(s) {
+  if (!s) return false;
+  // If it’s only a few characters, treat it as “no text layer”
+  // (some scanned PDFs include tiny garbage text)
+  const letters = s.replace(/[\s\d\p{P}]/gu, "");
+  return letters.length >= 15;
+}
+
+/* ----------------------------
+   OCR rendering
+----------------------------- */
+async function renderPageToCanvas(page, scale = 2.0) {
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+
+  // White background helps OCR
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const renderTask = page.render({
+    canvasContext: ctx,
+    viewport,
+  });
+
+  await renderTask.promise;
+  return canvas;
+}
+
+/* ----------------------------
+   Transliteration
+----------------------------- */
+function transliterateKannadaToTamil(input, toScript) {
+  if (!input) return "";
+
+  if (!AksharamukhaGlobal) {
+    // fallback: return original if Aksharamukha not loaded
+    return input;
+  }
+
+  // Aksharamukha API shapes differ between builds; handle common ones.
+  // Most commonly: Aksharamukha.transliterate(text, from, to)
+  // From script for Kannada is usually "Kannada"
+  try {
+    if (typeof AksharamukhaGlobal.transliterate === "function") {
+      return AksharamukhaGlobal.transliterate(input, "Kannada", toScript);
+    }
+    if (typeof AksharamukhaGlobal.convert === "function") {
+      return AksharamukhaGlobal.convert(input, "Kannada", toScript);
+    }
+  } catch (e) {
+    console.warn("Aksharamukha transliteration failed:", e);
+  }
+  return input;
+}
+
+/* ----------------------------
+   Output PDF formatting
+----------------------------- */
+async function buildTamilPdf(pageTexts) {
   const pdfDoc = await PDFDocument.create();
 
-  // IMPORTANT: fixes your error about embedFont needing fontkit :contentReference[oaicite:4]{index=4}
+  // REQUIRED for custom fonts:
   pdfDoc.registerFontkit(fontkit);
 
-  const fontBytes = await fetch(PDF_FONT_URL).then((r) => {
-    if (!r.ok) throw new Error(`Failed to load font at ${PDF_FONT_URL}`);
-    return r.arrayBuffer();
-  });
-
+  // Load Tamil font from your repo
+  // Put the file at: /fonts/NotoSansTamil-Regular.ttf
+  const fontBytes = await fetchBinary("fonts/NotoSansTamil-Regular.ttf");
   const tamilFont = await pdfDoc.embedFont(fontBytes, { subset: true });
 
-  for (let i = 0; i < pagesTamilText.length; i++) {
-    const pageText = pagesTamilText[i] || "";
+  // Layout settings
+  const fontSize = 12;
+  const lineHeight = Math.round(fontSize * 1.35);
+  const margin = 48;
 
-    const page = pdfDoc.addPage();
-    const { width, height } = page.getSize();
+  // A4 size in PDF points: 595.28 × 841.89 (approx)
+  const pageWidth = 595.28;
+  const pageHeight = 841.89;
 
-    const maxWidth = width - PAGE_MARGIN * 2;
-    let cursorY = height - PAGE_MARGIN;
+  for (let i = 0; i < pageTexts.length; i++) {
+    const txt = pageTexts[i] || "";
 
-    const paragraphs = pageText
-      .split(/\n{2,}/g)
-      .map((p) => p.trim())
-      .filter(Boolean);
+    // We may need multiple PDF pages for one input page if text is long
+    const paragraphs = txt.split(/\n{2,}/g).map((p) => p.trim()).filter(Boolean);
+    if (!paragraphs.length) {
+      // still output an empty page so counts match
+      const p = pdfDoc.addPage([pageWidth, pageHeight]);
+      p.drawText("(No text found on this page)", {
+        x: margin,
+        y: pageHeight - margin - fontSize,
+        size: fontSize,
+        font: tamilFont,
+      });
+      continue;
+    }
 
-    for (const para of paragraphs) {
-      const lines = wrapTextToLines(para, tamilFont, FONT_SIZE, maxWidth);
+    let page = pdfDoc.addPage([pageWidth, pageHeight]);
+    let y = pageHeight - margin;
 
-      for (const line of lines) {
-        // New page if needed
-        const lineHeight = FONT_SIZE + LINE_GAP;
-        if (cursorY - lineHeight < PAGE_MARGIN) {
-          // Start a new page
-          const newPage = pdfDoc.addPage();
-          cursorY = newPage.getSize().height - PAGE_MARGIN;
-          // Continue on new page
-          newPage.drawText(line, {
-            x: PAGE_MARGIN,
-            y: cursorY - FONT_SIZE,
-            size: FONT_SIZE,
-            font: tamilFont,
-            color: rgb(0, 0, 0),
-          });
-          cursorY -= lineHeight;
-          // Swap "page" reference for rest of paragraph
-          // (simple trick: redirect variable)
-          // eslint-disable-next-line no-param-reassign
-          pageText; // no-op
+    const maxWidth = pageWidth - margin * 2;
+
+    for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
+      const para = paragraphs[pIdx];
+
+      const wrapped = wrapText(para, tamilFont, fontSize, maxWidth);
+      for (const line of wrapped) {
+        y -= lineHeight;
+        if (y < margin) {
+          page = pdfDoc.addPage([pageWidth, pageHeight]);
+          y = pageHeight - margin - lineHeight;
+        }
+        page.drawText(line, {
+          x: margin,
+          y,
+          size: fontSize,
+          font: tamilFont,
+        });
+      }
+
+      // paragraph spacing
+      y -= Math.round(lineHeight * 0.6);
+      if (y < margin) {
+        page = pdfDoc.addPage([pageWidth, pageHeight]);
+        y = pageHeight - margin;
+      }
+    }
+  }
+
+  return await pdfDoc.save();
+}
+
+function wrapText(text, font, size, maxWidth) {
+  // Preserve single newlines as forced breaks if present
+  const forcedLines = text.split("\n").map((s) => s.trim());
+
+  const linesOut = [];
+  for (const forced of forcedLines) {
+    if (!forced) {
+      linesOut.push("");
+      continue;
+    }
+
+    const words = forced.split(/\s+/g);
+    let line = "";
+
+    for (const w of words) {
+      const test = line ? `${line} ${w}` : w;
+      const width = font.widthOfTextAtSize(test, size);
+      if (width <= maxWidth) {
+        line = test;
+      } else {
+        if (line) linesOut.push(line);
+        // If a single word is too long, hard-split it
+        if (font.widthOfTextAtSize(w, size) > maxWidth) {
+          const parts = hardSplitWord(w, font, size, maxWidth);
+          linesOut.push(...parts.slice(0, -1));
+          line = parts[parts.length - 1] || "";
         } else {
-          page.drawText(line, {
-            x: PAGE_MARGIN,
-            y: cursorY - FONT_SIZE,
-            size: FONT_SIZE,
-            font: tamilFont,
-            color: rgb(0, 0, 0),
-          });
-          cursorY -= lineHeight;
+          line = w;
         }
       }
-
-      // Paragraph spacing
-      cursorY -= FONT_SIZE * 0.5;
-      if (cursorY < PAGE_MARGIN) {
-        cursorY = height - PAGE_MARGIN;
-        pdfDoc.addPage();
-      }
     }
+    if (line) linesOut.push(line);
   }
-
-  const bytes = await pdfDoc.save();
-  return new Blob([bytes], { type: "application/pdf" });
+  return linesOut;
 }
 
-function wrapTextToLines(text, font, fontSize, maxWidth) {
-  // Keep punctuation and spacing decent
-  const words = text.replace(/\s+/g, " ").trim().split(" ");
-  const lines = [];
-  let current = "";
-
-  for (const w of words) {
-    const candidate = current ? `${current} ${w}` : w;
-    const width = font.widthOfTextAtSize(candidate, fontSize);
-
-    if (width <= maxWidth) {
-      current = candidate;
+function hardSplitWord(word, font, size, maxWidth) {
+  const out = [];
+  let cur = "";
+  for (const ch of [...word]) {
+    const test = cur + ch;
+    if (font.widthOfTextAtSize(test, size) <= maxWidth) {
+      cur = test;
     } else {
-      if (current) lines.push(current);
-      // If one word is too long, hard-break it
-      if (font.widthOfTextAtSize(w, fontSize) > maxWidth) {
-        lines.push(...hardBreakLongWord(w, font, fontSize, maxWidth));
-        current = "";
-      } else {
-        current = w;
-      }
+      if (cur) out.push(cur);
+      cur = ch;
     }
   }
-  if (current) lines.push(current);
-  return lines;
+  if (cur) out.push(cur);
+  return out;
 }
 
-function hardBreakLongWord(word, font, fontSize, maxWidth) {
-  const parts = [];
-  let buf = "";
-  for (const ch of word) {
-    const candidate = buf + ch;
-    if (font.widthOfTextAtSize(candidate, fontSize) <= maxWidth) {
-      buf = candidate;
-    } else {
-      if (buf) parts.push(buf);
-      buf = ch;
-    }
+/* ----------------------------
+   Helpers
+----------------------------- */
+async function fetchBinary(url) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to load ${url}. Put the font file in your repo at that path.`);
   }
-  if (buf) parts.push(buf);
-  return parts;
+  return new Uint8Array(await res.arrayBuffer());
 }
 
-// -----------------------
-// Main conversion flow
-// -----------------------
-async function convertPdf(file) {
-  $("downloadLink").style.display = "none";
-  $("outputText").value = "";
-
-  setStatus("Reading PDF...");
-  const arrayBuf = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuf }).promise;
-  const totalPages = pdf.numPages;
-
-  const tamilPages = [];
-
-  for (let p = 1; p <= totalPages; p++) {
-    setStatus(`Page ${p}/${totalPages}: checking text layer...`);
-
-    // 1) Try text-layer extraction
-    let extracted = await extractTextLayer(pdf, p);
-
-    // Heuristic: if very little text, treat as scan
-    if (!extracted || extracted.length < 10) {
-      setStatus(`Page ${p}/${totalPages}: no text layer → rendering for OCR...`);
-      const canvas = await renderPageToCanvas(pdf, p, OCR_RENDER_SCALE);
-
-      extracted = await ocrCanvasToText(canvas, p, totalPages);
-      if (!extracted || extracted.length < 2) {
-        extracted = "";
-      }
-    } else {
-      setStatus(`Page ${p}/${totalPages}: text layer found.`);
-    }
-
-    setStatus(`Page ${p}/${totalPages}: converting Kannada → Tamil...`);
-    const tamil = extracted ? await kannadaToTamil(extracted) : "";
-
-    tamilPages.push(tamil);
-
-    // Live preview (append)
-    $("outputText").value += `--- Page ${p} ---\n${tamil}\n\n`;
-  }
-
-  // Build output PDF
-  const outBlob = await buildTamilPdf(tamilPages);
-  setDownload(outBlob, `tamil_${file.name.replace(/\.pdf$/i, "")}.pdf`);
-
-  setStatus("Done ✅");
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
-
-// -----------------------
-// Wire up UI
-// -----------------------
-function init() {
-  const fileInput = $("pdfFile");
-  const btn = $("convertBtn");
-
-  if (!fileInput || !btn) {
-    console.error(
-      "Missing required elements: pdfFile, convertBtn (and status/outputText/downloadLink recommended)."
-    );
-    return;
-  }
-
-  btn.addEventListener("click", async () => {
-    const file = fileInput.files?.[0];
-    if (!file) {
-      setStatus("Please choose a PDF file first.");
-      return;
-    }
-
-    btn.disabled = true;
-    try {
-      await convertPdf(file);
-    } catch (err) {
-      console.error(err);
-      setStatus(`Error: ${err?.message || String(err)}`);
-    } finally {
-      btn.disabled = false;
-    }
-  });
-}
-
-init();
