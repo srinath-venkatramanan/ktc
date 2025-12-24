@@ -4,7 +4,7 @@ import react from '@vitejs/plugin-react'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
-  base: '/kan-translit-app/', // Initial guess, user can change if repo name differs
+  base: '/ktc/', // Updated for repo 'ktc'
   server: {
     '/api/transliterate': {
       target: 'https://aksharamukha-plugin.appspot.com',
